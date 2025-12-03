@@ -1,10 +1,9 @@
 // ==========================================
-// IMS 分析仪 - PlatformIO 移植版
-// 硬件: ESP32-S3 (N16R8) + ST7796U + FT6336
+// IMS 分析仪 - UI+ADC
+// 硬件: ESP32-S3 (N16R8) + ST7796U + FT6336 + ADS8681
 // ==========================================
 
 #include <Arduino.h> 
-
 #include <SPI.h>
 #include <Wire.h>
 #include <TFT_eSPI.h> 
@@ -12,7 +11,7 @@
 #include <lvgl.h>       
 
 #include "ui/ui.h"        
-
+#include "IMS_ADC.h"  
 // --- 1. 硬件引脚定义 ---
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
@@ -44,137 +43,103 @@ int detected_peak_amp = 0;              // 识别到的幅值
 bool ui_update_needed = false;          // 标志位：通知 UI 刷新
 
 // =====================================================================
-// 【修改】函数前向声明 (Prototypes)
-// C++ 编译器要求函数在使用前必须声明，这是与 .ino 最大的区别
+// 函数声明
 // =====================================================================
-void addGaussianPeak(int16_t* buffer, int pos, int width, int height);
-void Task_PhysicsEngine(void *pvParameters);
+void Task_Acquisition(void *pvParameters); 
 void OnScanClick(lv_event_t * e);
 void my_disp_flush( lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p );
 void my_touchpad_read( lv_indev_drv_t * indev_drv, lv_indev_data_t * data );
 
 // ==========================================
-//  辅助算法：生成高斯峰 (模拟波形用)
+//  任务 1 (Core 1): 真实 ADC 采集与信号处理
 // ==========================================
-// pos: 峰中心位置(0-199), width: 峰宽, height: 峰高
-void addGaussianPeak(int16_t* buffer, int pos, int width, int height) {
-    for (int i = 0; i < CHART_POINTS; i++) {
-        // 简单的钟形曲线公式
-        float val = height * exp(-0.5 * pow((i - pos) / (float)width, 2));
-        buffer[i] += (int16_t)val; // 叠加到现有波形上
-        
-        // 限制最大值防止溢出
-        if (buffer[i] > 4095) buffer[i] = 4095;
-    }
-}
-
-// ==========================================
-//  任务 1 (Core 1): 物理引擎与信号处理
-// ==========================================
-void Task_PhysicsEngine(void *pvParameters) {
+void Task_Acquisition(void *pvParameters) {
     (void) pvParameters;
     
-    // 模拟变量
-    float rip_height = 3500.0;  // RIP 峰高度 (基准)
-    float target_conc = 0.0;    // 目标物质浓度 (0.0 - 1.0)
-    
-    // 物理参数
-    int rip_base_pos = 40;           // RIP 在约 5ms 处 (40/200 * 25ms)
-    int target_base_pos = 120;       // 目标物质在约 15ms 处
-    
+    // 简单的峰值搜索辅助变量
+    int local_max_val = 0;
+    int local_max_idx = 0;
+
     while (true) {
-        // 1. 状态机：模拟物质进入和清洗的过程
+        // 1. 如果处于扫描状态，开始采集
         if (isScanning) {
-            // 开启扫描：浓度慢慢上升
-            if (target_conc < 1.0) target_conc += 0.02; 
-        } else {
-            // 停止扫描：浓度慢慢下降 (清洗过程)
-            if (target_conc > 0.0) target_conc -= 0.05;
-            if (target_conc < 0.0) target_conc = 0.0;
-        }
-
-        // 2. 锁定内存，开始合成波形
-        if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
             
-            // A. 清空并添加底噪
-            for(int i=0; i<CHART_POINTS; i++) {
-                waveform_buffer[i] = random(200, 250); // 基线底噪
-            }
-
-            // 真实仪器受温度气流影响，峰的位置会轻微跳动
-            // random(-2, 3) 会产生 -2, -1, 0, 1, 2 的随机偏移
-            // ---------------------------------------------------------
-            int current_rip_pos = rip_base_pos + random(-1, 2);
-            int current_target_pos = target_base_pos + random(-3, 4);
-
-            // B. 叠加 RIP 峰 (一直存在)
-            // 模拟电荷竞争：如果目标物质多了，RIP 会稍微降低
-            float current_rip = rip_height - (target_conc * 800);
-            addGaussianPeak(waveform_buffer, current_rip_pos, 8, current_rip);
-
-            // C. 叠加目标物质峰 (根据浓度)
-            if (target_conc > 0.01) {
-                float current_target = target_conc * 2500; // 最大高度 2500
-                addGaussianPeak(waveform_buffer, current_target_pos, 10, current_target);
+            // 锁定内存，防止 UI 在我们写数据的时候读数据导致花屏
+            if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
                 
-                // 我们不直接用 current_target_pos，而是去数组里“实测”它在哪
-                // 关键：从 index 70 开始找 (跳过 RIP 所在的 0-60 区域)
-                // ---------------------------------------------------------
-                int search_start_index = 70; // 约 8.75ms 之后
-                int max_val = 0;
-                int max_idx = 0;
+                local_max_val = 0;
+                local_max_idx = 0;
 
-                for (int k = search_start_index; k < CHART_POINTS; k++) {
-                    if (waveform_buffer[k] > max_val) {
-                        max_val = waveform_buffer[k];
-                        max_idx = k;
+                // ---【核心修改：采集循环】---
+                // 这里我们快速读取 200 次 ADC，填满一个屏幕的波形
+                // 此时还没做离子门同步，所以这是一个“滚动示波器”模式
+                for(int i = 0; i < CHART_POINTS; i++) {
+                    
+                    // 1. 读取真实硬件数据 (16位: 0-65535)
+                    uint16_t raw_val = IMS_ADC_ReadRaw(); 
+
+                    // 2. 数据缩放 (适配 UI)
+                    // ADS8681 是 16位 (0-65535)
+                    // SquareLine 图表通常默认范围较小 (0-1000 或 0-4096)
+                    // 这里我们将数据除以 10 (或右移 4 位)，让波形能完整显示在屏幕上
+                    int16_t scaled_val = raw_val / 10; 
+                    
+                    waveform_buffer[i] = scaled_val;
+
+                    // 3. 顺便找一下最大值 (简单的峰值检测)
+                    if (scaled_val > local_max_val) {
+                        local_max_val = scaled_val;
+                        local_max_idx = i;
                     }
+                    
+                    // 控制采样率：
+                    // 如果不加延时，ESP32 读取这 200 个点可能只需要 1ms
+                    // 真实的 IMS 谱图通常横坐标总长是 20ms - 30ms
+                    // delayMicroseconds(100); // 可选：调节横轴时间跨度
                 }
 
-                // 只有当找到的峰足够高 (大于底噪+余量，例如400) 时才更新显示
-                if (max_val > 400) {
-                    // 实时计算：把数组下标转回时间 (0-200 -> 0-25ms)
-                    detected_peak_time = (float)max_idx / CHART_POINTS * 25.0;
-                    detected_peak_amp = max_val;
+                // --- 简单的信号处理结果更新 ---
+                // 只有当信号强度大于一定底噪 (例如 raw > 500 => scaled > 50)
+                if (local_max_val > 50) {
+                    // 假设横轴总长对应 25ms (根据你的实际采样率计算)
+                    detected_peak_time = (float)local_max_idx / CHART_POINTS * 25.0;
+                    detected_peak_amp = local_max_val;
+                } else {
+                    detected_peak_time = 0.0;
+                    detected_peak_amp = 0;
                 }
-                
-            } else {
-                // 浓度太低或是停止状态，归零
-                detected_peak_time = 0.0;
-                detected_peak_amp = 0;
+
+                ui_update_needed = true; // 告诉 UI 可以画了
+                xSemaphoreGive(dataMutex); // 解锁
             }
-
-            ui_update_needed = true; // 告诉 UI 可以画了
-            xSemaphoreGive(dataMutex); // 解锁
+        } else {
+            // 如果暂停扫描，休息一下，避免死循环占用 CPU
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50)); // 刷新率约 30FPS
+        // 这里的延时决定了屏幕刷新的“帧率”
+        // 50ms = 20FPS，对于人眼观察足够了
+        vTaskDelay(pdMS_TO_TICKS(50)); 
     }
 }
 
 // ==========================================
-//  SquareLine 事件回调函数 (按钮点击)
+//  SquareLine 事件回调函数
 // ==========================================
-// 请在 SquareLine 里把按钮的 Click 事件绑定到这个函数名: OnScanClick
 void OnScanClick(lv_event_t * e) {
-    // 1. 切换状态
     isScanning = !isScanning;
     
-    // 2. 获取按钮和里面的 Label
-    // 【修改建议】在 C++ 中 e->target 是 void*，最好使用 LVGL 提供的标准获取函数
     lv_obj_t * ui_Button9 = lv_event_get_target(e); 
-    lv_obj_t * label = lv_obj_get_child(ui_Button9, 0); // 获取按钮里的第一个子控件(Label)
+    lv_obj_t * label = lv_obj_get_child(ui_Button9, 0); 
 
     if (isScanning) {
-        // --- 变为：暂停扫描 ---
-        lv_label_set_text(label, "暂停扫描");
-        lv_obj_set_style_bg_color(ui_Button9, lv_color_hex(0x00AA00), LV_PART_MAIN); // 变绿色
-        Serial.println("State: SCANNING");
+        lv_label_set_text(label, "暂停采样"); // 修改文案以体现真实功能
+        lv_obj_set_style_bg_color(ui_Button9, lv_color_hex(0x00AA00), LV_PART_MAIN); 
+        Serial.println("Action: ADC Start");
     } else {
-        // --- 变为：开始扫描 ---
-        lv_label_set_text(label, "开始扫描");
-        lv_obj_set_style_bg_color(ui_Button9, lv_color_hex(0x0869B4), LV_PART_MAIN); // 变回蓝色 (根据你原来的颜色调)
-        Serial.println("State: PAUSED");
+        lv_label_set_text(label, "开始采样");
+        lv_obj_set_style_bg_color(ui_Button9, lv_color_hex(0x0869B4), LV_PART_MAIN); 
+        Serial.println("Action: ADC Stop");
     }
 }
 
@@ -195,7 +160,7 @@ void my_touchpad_read( lv_indev_drv_t * indev_drv, lv_indev_data_t * data ) {
     ts.read(); 
     if( ts.touches > 0 ) {
         data->state = LV_INDEV_STATE_PR;
-        data->point.x = ts.points[0].y;         // 翻转坐标 (根据你的屏幕调整)
+        data->point.x = ts.points[0].y;        
         data->point.y = 319 - ts.points[0].x;
     } else {
         data->state = LV_INDEV_STATE_REL;
@@ -213,6 +178,12 @@ void setup() {
 
     // 2. 硬件初始化
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    
+    // 【新增 2】初始化 ADC 芯片
+    // 这一步非常重要，必须在任务启动前完成
+    IMS_ADC_Init(); 
+    Serial.println("ADC Hardware Initialized.");
+
     tft.init();
     tft.setRotation(1);
     tft.invertDisplay(true);
@@ -221,30 +192,17 @@ void setup() {
 
     // 3. LVGL 初始化
     lv_init();
-    
-    // 计算全屏所需的字节数
     size_t buffer_size = screenWidth * screenHeight * sizeof(lv_color_t);
-
-    // 使用 heap_caps_malloc 强制在 PSRAM (SPIRAM) 中分配
     buf = (lv_color_t*) heap_caps_malloc(buffer_size, MALLOC_CAP_SPIRAM);
     
-    // 添加分配失败的“后悔药” (Fallback)
     if (buf == NULL) {
-        Serial.println("PSRAM Malloc FAILED! 使用内部 RAM 局部缓冲 (可能会闪烁)");
-        
-        // 如果 PSRAM 没开或满了，回退到旧方案：只申请 1/10 屏幕大小
-        // 使用普通 malloc (默认分配内部 RAM)
+        Serial.println("PSRAM Fail. Using internal RAM.");
         buf = (lv_color_t*) malloc(screenWidth * 32 * sizeof(lv_color_t));
-        
-        // 初始化局部缓冲
         lv_disp_draw_buf_init( &draw_buf, buf, NULL, screenWidth * 32 );
     } else {
-        Serial.println("PSRAM Malloc SUCCESS! 全屏缓冲已启用 (丝滑模式)");
-        
-        // 初始化全屏缓冲
+        Serial.println("PSRAM OK. Full buffer.");
         lv_disp_draw_buf_init( &draw_buf, buf, NULL, screenWidth * screenHeight );
     }
-
 
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init( &disp_drv );
@@ -260,23 +218,19 @@ void setup() {
     indev_drv.read_cb = my_touchpad_read;
     lv_indev_drv_register( &indev_drv );
 
-    // 4. UI 初始化
     ui_init();
     
-    // 5. 获取图表句柄 (假设 SquareLine 里图表叫 ui_Chart1)
-    // Series 指针必须在 ui_init 后获取
+    // 获取图表句柄
     ui_SignalSeries = lv_chart_get_series_next(ui_Chart1, NULL);
-    // 设置为直接刷新模式，不显示点，只显示线
     lv_chart_set_update_mode(ui_Chart1, LV_CHART_UPDATE_MODE_SHIFT);
-    // 确保点数一致
     lv_chart_set_point_count(ui_Chart1, CHART_POINTS);
 
-    // 6. 启动物理模拟任务 (Core 1)
+    // 4. 启动采集任务 (Core 1)
     xTaskCreatePinnedToCore(
-        Task_PhysicsEngine, "Physics", 4096, NULL, 1, NULL, 1
-    );
+        Task_Acquisition, "IMS_ADC", 4096, NULL, 1, NULL, 1
+    ); // 改名后的任务
 
-    Serial.println("IMS System Started.");
+    Serial.println("IMS System Ready.");
 }
 
 // ==========================================
@@ -285,31 +239,30 @@ void setup() {
 void loop() {
     // 1. 检查是否有新波形需要绘制
     if (ui_update_needed) {
-        if (xSemaphoreTake(dataMutex, 0) == pdTRUE) { // 尝试获取锁
+        if (xSemaphoreTake(dataMutex, 0) == pdTRUE) { 
             
             // A. 刷新波形
             if (ui_SignalSeries != NULL) {
+                // 将采集到的 ADC 数组直接推给图表
                 lv_chart_set_ext_y_array(ui_Chart1, ui_SignalSeries, (lv_coord_t*)waveform_buffer);
-                lv_chart_refresh(ui_Chart1); // 强制重绘
+                lv_chart_refresh(ui_Chart1); 
             }
 
-            // B. 刷新下方的数值 (只有在有物质时才显示)
-            if (isScanning && detected_peak_amp > 100) {
-                // 格式化字符串
+            // B. 刷新数值 (峰值检测结果)
+            if (isScanning && detected_peak_amp > 0) {
                 static char buf_time[16];
                 static char buf_amp[16];
                 
                 sprintf(buf_time, "%.2f ms", detected_peak_time);
                 sprintf(buf_amp, "%d", detected_peak_amp);
                 
-                // 这里需要你替换成你真实的 Label 变量名
-                // 如果你的 ui.h 里没有 ui_Label18/19，编译会报错，请修改为你真实的名字
+                // 注意：这里需要根据你 SquareLine 里真实的 Label 名字来改
+                // 假设 ui.h 里叫 ui_Label18 和 ui_Label19
                 if(ui_Label18) lv_label_set_text(ui_Label18, buf_time); 
                 if(ui_Label19) lv_label_set_text(ui_Label19, buf_amp);
             } else {
-                // 没扫到或暂停时，显示横杠
                  if(ui_Label18) lv_label_set_text(ui_Label18, "--.--");
-                 if(ui_Label19) lv_label_set_text(ui_Label19, "---");
+                 if(ui_Label19) lv_label_set_text(ui_Label19, "STOP");
             }
             
             ui_update_needed = false;
@@ -317,7 +270,7 @@ void loop() {
         }
     }
 
-    // 2. LVGL 心跳
+    // 2. LVGL 保持心跳
     lv_timer_handler();
     lv_tick_inc(5);
     delay(5);
