@@ -186,6 +186,11 @@ void setup() {
 
     tft.init();
     tft.setRotation(1);
+
+    #define TFT_BL_PIN 5  
+    pinMode(TFT_BL_PIN, OUTPUT);
+    digitalWrite(TFT_BL_PIN, HIGH);
+
     tft.invertDisplay(true);
     tft.fillScreen(TFT_BLACK);
     ts.begin();

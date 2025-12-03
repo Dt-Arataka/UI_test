@@ -1,7 +1,6 @@
 #include "IMS_ADC.h"
 #include <SPI.h>
 
-// ================= 配置区域 =================
 // 定义引脚 
 #define ADS_RST   14
 #define ADS_CS    15
