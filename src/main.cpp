@@ -82,7 +82,7 @@ void Task_Acquisition(void *pvParameters) {
                     // ADS8681 是 16位 (0-65535)
                     // SquareLine 图表通常默认范围较小 (0-1000 或 0-4096)
                     // 这里我们将数据除以 10 (或右移 4 位)，让波形能完整显示在屏幕上
-                    int16_t scaled_val = raw_val / 10; 
+                    int16_t scaled_val = raw_val / 16; 
                     
                     waveform_buffer[i] = scaled_val;
 
@@ -133,11 +133,11 @@ void OnScanClick(lv_event_t * e) {
     lv_obj_t * label = lv_obj_get_child(ui_Button9, 0); 
 
     if (isScanning) {
-        lv_label_set_text(label, "暂停采样"); // 修改文案以体现真实功能
+        lv_label_set_text(label, "暂停扫描"); // 修改文案以体现真实功能
         lv_obj_set_style_bg_color(ui_Button9, lv_color_hex(0x00AA00), LV_PART_MAIN); 
         Serial.println("Action: ADC Start");
     } else {
-        lv_label_set_text(label, "开始采样");
+        lv_label_set_text(label, "开始扫描");
         lv_obj_set_style_bg_color(ui_Button9, lv_color_hex(0x0869B4), LV_PART_MAIN); 
         Serial.println("Action: ADC Stop");
     }
@@ -186,11 +186,6 @@ void setup() {
 
     tft.init();
     tft.setRotation(1);
-
-    #define TFT_BL_PIN 5  
-    pinMode(TFT_BL_PIN, OUTPUT);
-    digitalWrite(TFT_BL_PIN, HIGH);
-
     tft.invertDisplay(true);
     tft.fillScreen(TFT_BLACK);
     ts.begin();
