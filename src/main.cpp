@@ -20,6 +20,8 @@
 #define TOUCH_RAW_WIDTH 320  
 #define TOUCH_RAW_HEIGHT 480 
 
+#define TEST_SIGNAL_PIN 48
+
 // --- 2. 屏幕与图表参数 ---
 static const uint16_t screenWidth  = 480;
 static const uint16_t screenHeight = 320;
@@ -95,7 +97,7 @@ void Task_Acquisition(void *pvParameters) {
                     // 控制采样率：
                     // 如果不加延时，ESP32 读取这 200 个点可能只需要 1ms
                     // 真实的 IMS 谱图通常横坐标总长是 20ms - 30ms
-                    // delayMicroseconds(100); // 可选：调节横轴时间跨度
+                    delayMicroseconds(85); // 可选：调节横轴时间跨度
                 }
 
                 // --- 简单的信号处理结果更新 ---
@@ -229,6 +231,25 @@ void setup() {
     xTaskCreatePinnedToCore(
         Task_Acquisition, "IMS_ADC", 4096, NULL, 1, NULL, 1
     ); // 改名后的任务
+
+// 配置 LEDC 通道 0，频率 5 Hz，分辨率 8 位
+    // 5Hz 意味着波形每秒跳变 5 次，在图表上很容易看清
+    ledcSetup(0, 1000, 8); 
+    
+    // 将通道 0 绑定到测试引脚
+    ledcAttachPin(TEST_SIGNAL_PIN, 0);
+    
+    // 输出 50% 占空比的方波 (256/2 = 128)
+    ledcWrite(0, 128); 
+
+
+// 1. 设置引脚为输出模式
+    // pinMode(TEST_SIGNAL_PIN, OUTPUT);
+    
+    // // 2. 强制拉高 (输出 3.3V)
+    // digitalWrite(TEST_SIGNAL_PIN, HIGH);
+
+
 
     Serial.println("IMS System Ready.");
 }
