@@ -8,8 +8,8 @@
 #define ADS_MISO  17  // SDO0
 #define ADS_SCLK  18
 
-// 定义 SPI 速度 (20MHz)
-#define ADS_SPI_SPEED 20000000 
+// 定义 SPI 速度 ：1M * 32bit
+#define ADS_SPI_SPEED 40000000 
 
 // 创建一个独立的 SPI 实例 (使用 FSPI 硬件通道)
 SPIClass adcSPI(FSPI);
@@ -75,4 +75,32 @@ float IMS_ADC_ReadVoltage() {
     uint16_t raw = IMS_ADC_ReadRaw();
     // 将 0-65535 映射到 0-5.12V
     return (raw / 65536.0f) * 5.12f;
+}
+
+// 
+void IMS_ADC_ReadBurst(uint16_t *buffer, size_t count) {
+    // 1. 启动 SPI 事务
+    adcSPI.beginTransaction(SPISettings(ADS_SPI_SPEED, MSBFIRST, SPI_MODE0));
+    
+    // 2. 循环读取 (必须每次翻转 CS!)
+    for(size_t i = 0; i < count; i++) {
+        // --- 关键修改：手动翻转 CS ---
+        
+        digitalWrite(ADS_CS, LOW);  // 触发采样 & 开始传输
+        
+        // 传输 16 位 (2字节)
+        // transfer16 比 transferBytes 在单次操作中更高效
+        uint16_t val = adcSPI.transfer16(0x0000); 
+        
+        digitalWrite(ADS_CS, HIGH); // 结束本次采样，准备下一次
+        
+        // --- 存入 Buffer ---
+        buffer[i] = val;
+        
+        // 微小的延时可能需要，但在 40MHz SPI 下，GPIO 操作本身的开销通常已经够了
+        // 如果发现数据不稳，可以在这里加极其微小的延时
+    }
+    
+    // 3. 结束事务
+    adcSPI.endTransaction();
 }

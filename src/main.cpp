@@ -27,6 +27,15 @@ static const uint16_t screenWidth  = 480;
 static const uint16_t screenHeight = 320;
 #define CHART_POINTS 200    // 图表分辨率 (必须与 SquareLine 一致)
 
+// IMS 核心参数
+#define IMS_SAMPLE_RATE     1000000 // 1MSPS
+#define IMS_DURATION_MS     24      // 采样时长 24ms
+#define RAW_DATA_LEN        (IMS_SAMPLE_RATE * IMS_DURATION_MS / 1000) // = 24000点
+// 定义一个全局指针，指向大内存区域
+// 初始化为 NULL，防止未分配直接使用导致崩溃
+uint16_t *big_raw_buffer = NULL;
+
+
 // --- 3. 全局对象 ---
 TFT_eSPI tft = TFT_eSPI();
 FT6336 ts = FT6336(I2C_SDA_PIN, I2C_SCL_PIN, CTP_INT_PIN, CTP_RST_PIN, TOUCH_RAW_WIDTH, TOUCH_RAW_HEIGHT);
@@ -58,70 +67,84 @@ void my_touchpad_read( lv_indev_drv_t * indev_drv, lv_indev_data_t * data );
 void Task_Acquisition(void *pvParameters) {
     (void) pvParameters;
     
-    // 简单的峰值搜索辅助变量
-    int local_max_val = 0;
-    int local_max_idx = 0;
-
     while (true) {
-        // 1. 如果处于扫描状态，开始采集
-        if (isScanning) {
+        // 只有当点击了“开始扫描” 且 内存分配成功时才运行
+        if (isScanning && big_raw_buffer != NULL) {
             
-            // 锁定内存，防止 UI 在我们写数据的时候读数据导致花屏
+            // -----------------------------------------------------
+            // 阶段 1: 硬件高速采集 (占用约 25ms)
+            // -----------------------------------------------------
+            
+            // TODO: 这里未来需要添加一行代码打开离子门 (Open Gate)
+            // digitalWrite(ION_GATE_PIN, HIGH); delayMicroseconds(200); digitalWrite(ION_GATE_PIN, LOW);
+            
+            // 调用刚才写的驱动，一口气吸入 25000 个点
+            // 这时候 CPU 会全速运转 SPI，不再有 delay
+            IMS_ADC_ReadBurst(big_raw_buffer, RAW_DATA_LEN);
+            
+            // -----------------------------------------------------
+            // 阶段 2: 数据压缩与显示 (Peak Hold 算法)
+            // -----------------------------------------------------
+            
+            // 尝试获取锁，准备更新 UI 数据
             if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
                 
-                local_max_val = 0;
-                local_max_idx = 0;
+                // 计算压缩比：25000点 / 200像素 = 125
+                // 也就是每 125 个原始数据合成 1 个屏幕像素
+                int ratio = RAW_DATA_LEN / CHART_POINTS; 
+                
+                int global_max_val = 0;
+                int global_max_idx = 0;
 
-                // ---【核心修改：采集循环】---
-                // 这里我们快速读取 200 次 ADC，填满一个屏幕的波形
-                // 此时还没做离子门同步，所以这是一个“滚动示波器”模式
-                for(int i = 0; i < CHART_POINTS; i++) {
+                // 遍历屏幕的每一个像素点
+                for (int i = 0; i < CHART_POINTS; i++) {
+                    int local_max = 0;
                     
-                    // 1. 读取真实硬件数据 (16位: 0-65535)
-                    uint16_t raw_val = IMS_ADC_ReadRaw(); 
+                    // --- 峰值保持算法 (解决 50us 窄峰看不见的问题) ---
+                    // 在属于这个像素的 125 个原始数据中找最大值
+                    for (int j = 0; j < ratio; j++) {
+                        // 防止越界安全检查
+                        if ((i * ratio + j) >= RAW_DATA_LEN) break;
 
-                    // 2. 数据缩放 (适配 UI)
-                    // ADS8681 是 16位 (0-65535)
-                    // SquareLine 图表通常默认范围较小 (0-1000 或 0-4096)
-                    // 这里我们将数据除以 10 (或右移 4 位)，让波形能完整显示在屏幕上
-                    int16_t scaled_val = raw_val / 16; 
-                    
-                    waveform_buffer[i] = scaled_val;
+                        // 取出原始数据
+                        uint16_t val = big_raw_buffer[i * ratio + j];
+                        
+                        // 【非常重要】大小端转换 (Byte Swap)
+                        // SPI 传回来是 [高8位][低8位]，但在 ESP32 内存里这代表错误的值
+                        // 我们需要交换一下位置
+                        // val = (val << 8) | (val >> 8);
 
-                    // 3. 顺便找一下最大值 (简单的峰值检测)
-                    if (scaled_val > local_max_val) {
-                        local_max_val = scaled_val;
-                        local_max_idx = i;
+                        // 记录这微小时间段内的最大值
+                        if (val > local_max) local_max = val;
                     }
                     
-                    // 控制采样率：
-                    // 如果不加延时，ESP32 读取这 200 个点可能只需要 1ms
-                    // 真实的 IMS 谱图通常横坐标总长是 20ms - 30ms
-                    delayMicroseconds(85); // 可选：调节横轴时间跨度
+                    // 将找到的峰值赋给显示缓存 (除以16是为了适应屏幕高度)
+                    waveform_buffer[i] = local_max / 16; 
+                    
+                    // 顺便记录整张谱图的最高峰，用于显示数值
+                    if (local_max > global_max_val) {
+                        global_max_val = local_max;
+                        global_max_idx = i * ratio; // 记录原始索引位置
+                    }
                 }
+                
+                // 计算物理时间：索引 * 1us (因为是 1MSPS)
+                detected_peak_time = (float)global_max_idx / 1000.0; // us -> ms
+                detected_peak_amp = global_max_val;
 
-                // --- 简单的信号处理结果更新 ---
-                // 只有当信号强度大于一定底噪 (例如 raw > 500 => scaled > 50)
-                if (local_max_val > 50) {
-                    // 假设横轴总长对应 25ms (根据你的实际采样率计算)
-                    detected_peak_time = (float)local_max_idx / CHART_POINTS * 25.0;
-                    detected_peak_amp = local_max_val;
-                } else {
-                    detected_peak_time = 0.0;
-                    detected_peak_amp = 0;
-                }
-
-                ui_update_needed = true; // 告诉 UI 可以画了
-                xSemaphoreGive(dataMutex); // 解锁
+                // 标记刷新，解锁
+                ui_update_needed = true;
+                xSemaphoreGive(dataMutex);
             }
+            
+            // 采集完成一次，稍微休息一下，控制 FPS
+            // 例如延时 100ms，代表每秒刷新 10 次谱图
+            vTaskDelay(pdMS_TO_TICKS(100)); 
+            
         } else {
-            // 如果暂停扫描，休息一下，避免死循环占用 CPU
+            // 暂停状态，降低 CPU 占用
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-
-        // 这里的延时决定了屏幕刷新的“帧率”
-        // 50ms = 20FPS，对于人眼观察足够了
-        vTaskDelay(pdMS_TO_TICKS(50)); 
     }
 }
 
@@ -186,6 +209,34 @@ void setup() {
     IMS_ADC_Init(); 
     Serial.println("ADC Hardware Initialized.");
 
+    // 计算所需字节数 (每个数据是 uint16_t，占 2 字节)
+    // 25000 * 2 = 50,000 Bytes (约 48.8KB)
+    size_t buffer_size_bytes = RAW_DATA_LEN * sizeof(uint16_t);
+    Serial.printf("Attempting to allocate %d bytes for ADC buffer...\n", buffer_size_bytes);
+    // 1. 优先尝试从 PSRAM (SPIRAM) 分配
+    // MALLOC_CAP_SPIRAM: 指定从外部 PSRAM 分配
+    big_raw_buffer = (uint16_t *)heap_caps_malloc(buffer_size_bytes, MALLOC_CAP_SPIRAM);
+    if (big_raw_buffer != NULL) {
+        Serial.println("Success! Buffer allocated in PSRAM (External Memory).");
+    } else {
+        // 2. 如果 PSRAM 分配失败（或者板子没开启 PSRAM），回退尝试内部 RAM
+        Serial.println("Warning: PSRAM allocation failed. Trying Internal RAM...");
+        big_raw_buffer = (uint16_t *)malloc(buffer_size_bytes);
+        if (big_raw_buffer != NULL) {
+            Serial.println("Success! Buffer allocated in Internal RAM.");
+        } else {
+            // 3. 如果内部 RAM 也不够，那是严重的致命错误
+            Serial.println("CRITICAL ERROR: Failed to allocate memory! System Halted.");
+            while (1) { delay(1000); } // 死循环卡住，防止后面程序崩溃
+        }
+    }
+    
+    // 4. (可选) 这是一个好习惯：把内存清零，防止显示上次残留的垃圾数据
+    if (big_raw_buffer != NULL) {
+        memset(big_raw_buffer, 0, buffer_size_bytes);
+    }
+
+
     tft.init();
     tft.setRotation(1);
     tft.invertDisplay(true);
@@ -229,12 +280,12 @@ void setup() {
 
     // 4. 启动采集任务 (Core 1)
     xTaskCreatePinnedToCore(
-        Task_Acquisition, "IMS_ADC", 4096, NULL, 1, NULL, 1
+        Task_Acquisition, "IMS_ADC", 4096, NULL, 10, NULL, 1
     ); // 改名后的任务
 
-// 配置 LEDC 通道 0，频率 5 Hz，分辨率 8 位
+    // 配置 LEDC 通道 0，频率 5 Hz，分辨率 8 位
     // 5Hz 意味着波形每秒跳变 5 次，在图表上很容易看清
-    ledcSetup(0, 1000, 8); 
+    ledcSetup(0, 200, 8); 
     
     // 将通道 0 绑定到测试引脚
     ledcAttachPin(TEST_SIGNAL_PIN, 0);
@@ -243,19 +294,22 @@ void setup() {
     ledcWrite(0, 128); 
 
 
-// 1. 设置引脚为输出模式
+    // 1. 设置引脚为输出模式
     // pinMode(TEST_SIGNAL_PIN, OUTPUT);
-    
     // // 2. 强制拉高 (输出 3.3V)
     // digitalWrite(TEST_SIGNAL_PIN, HIGH);
 
 
+    // 查看 loop() 属于哪个核心
+    TaskHandle_t h = xTaskGetCurrentTaskHandle();
+    Serial.print("loop() task core: ");
+    Serial.println(xTaskGetAffinity(h));
 
     Serial.println("IMS System Ready.");
 }
 
 // ==========================================
-//  Loop (Core 0 UI 刷新)
+//  Loop (Core 1 UI 刷新)
 // ==========================================
 void loop() {
     // 1. 检查是否有新波形需要绘制

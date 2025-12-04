@@ -23,4 +23,9 @@ uint16_t IMS_ADC_ReadRaw();
  */
 float IMS_ADC_ReadVoltage();
 
+// 突发模式读取函数 (一次读一堆)
+// buffer: 接收数据的数组指针
+// count: 要读取的点数 (例如 25000)
+void IMS_ADC_ReadBurst(uint16_t *buffer, size_t count);
+
 #endif
