@@ -1,5 +1,7 @@
 #include "IMS_ADC.h"
 #include <SPI.h>
+#include "soc/gpio_struct.h"
+#include "driver/gpio.h"
 
 // 定义引脚 
 #define ADS_RST   14
@@ -79,28 +81,83 @@ float IMS_ADC_ReadVoltage() {
 
 // 
 void IMS_ADC_ReadBurst(uint16_t *buffer, size_t count) {
-    // 1. 启动 SPI 事务
+    // 1. 启动 SPI 事务 (保持 40MHz)
     adcSPI.beginTransaction(SPISettings(ADS_SPI_SPEED, MSBFIRST, SPI_MODE0));
+
+    // 2. 准备 GPIO 寄存器操作 (避开 digitalWrite 的巨大开销)
+    // 注意：这只适用于 GPIO 0-31。你的 CS 是 15，完全适用。
+    // 如果 CS > 31，需要用 GPIO.out1_w1tc.val
+    const uint32_t cs_mask = (1 << ADS_CS); 
+
+    // 3. 循环展开 (Loop Unrolling)
+    // 原理：减少 for 循环 i++ 和判断 i < count 的次数，节省 CPU 周期
+    // 我们一次读 10 个数据，这样循环开销就减少了 90%
+    size_t main_loop = count / 10;
+    size_t remainder = count % 10;
     
-    // 2. 循环读取 (必须每次翻转 CS!)
-    for(size_t i = 0; i < count; i++) {
-        // --- 关键修改：手动翻转 CS ---
+    uint16_t *ptr = buffer;
+
+    // --- 主循环 (每次处理 10 个点) ---
+    for (size_t i = 0; i < main_loop; i++) {
         
-        digitalWrite(ADS_CS, LOW);  // 触发采样 & 开始传输
+        // 第 1 个点
+        GPIO.out_w1tc = cs_mask;       // [极速] CS 拉低 (Clear)
+        *ptr++ = adcSPI.transfer16(0);     // 读数据 (耗时约 0.4us)
+        GPIO.out_w1ts = cs_mask;       // [极速] CS 拉高 (Set)
         
-        // 传输 16 位 (2字节)
-        // transfer16 比 transferBytes 在单次操作中更高效
-        uint16_t val = adcSPI.transfer16(0x0000); 
-        
-        digitalWrite(ADS_CS, HIGH); // 结束本次采样，准备下一次
-        
-        // --- 存入 Buffer ---
-        buffer[i] = val;
-        
-        // 微小的延时可能需要，但在 40MHz SPI 下，GPIO 操作本身的开销通常已经够了
-        // 如果发现数据不稳，可以在这里加极其微小的延时
+        // 第 2 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
+
+        // 第 3 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
+
+        // 第 4 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
+
+        // 第 5 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
+
+        // 第 6 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
+
+        // 第 7 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
+
+        // 第 8 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
+
+        // 第 9 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
+
+        // 第 10 个点
+        GPIO.out_w1tc = cs_mask; 
+        *ptr++ = adcSPI.transfer16(0); 
+        GPIO.out_w1ts = cs_mask;
     }
-    
-    // 3. 结束事务
+
+    // --- 处理剩下的尾数 (不足10个的部分) ---
+    for (size_t i = 0; i < remainder; i++) {
+        GPIO.out_w1tc = cs_mask;
+        *ptr++ = adcSPI.transfer16(0);
+        GPIO.out_w1ts = cs_mask;
+    }
+
+    // 4. 结束事务
     adcSPI.endTransaction();
 }

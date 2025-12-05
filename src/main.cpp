@@ -119,7 +119,7 @@ void Task_Acquisition(void *pvParameters) {
                     }
                     
                     // 将找到的峰值赋给显示缓存 (除以16是为了适应屏幕高度)
-                    waveform_buffer[i] = local_max / 16; 
+                    waveform_buffer[i] = local_max / 16 ; 
                     
                     // 顺便记录整张谱图的最高峰，用于显示数值
                     if (local_max > global_max_val) {
@@ -130,7 +130,7 @@ void Task_Acquisition(void *pvParameters) {
                 
                 // 计算物理时间：索引 * 1us (因为是 1MSPS)
                 detected_peak_time = (float)global_max_idx / 1000.0; // us -> ms
-                detected_peak_amp = global_max_val;
+                detected_peak_amp = global_max_val / 16;
 
                 // 标记刷新，解锁
                 ui_update_needed = true;
@@ -285,7 +285,7 @@ void setup() {
 
     // 配置 LEDC 通道 0，频率 5 Hz，分辨率 8 位
     // 5Hz 意味着波形每秒跳变 5 次，在图表上很容易看清
-    ledcSetup(0, 200, 8); 
+    ledcSetup(0, 500, 8); 
     
     // 将通道 0 绑定到测试引脚
     ledcAttachPin(TEST_SIGNAL_PIN, 0);
