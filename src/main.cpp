@@ -112,7 +112,7 @@ void Task_Acquisition(void *pvParameters) {
                         // 【非常重要】大小端转换 (Byte Swap)
                         // SPI 传回来是 [高8位][低8位]，但在 ESP32 内存里这代表错误的值
                         // 我们需要交换一下位置
-                        // val = (val << 8) | (val >> 8);
+                        val = (val << 8) | (val >> 8);
 
                         // 记录这微小时间段内的最大值
                         if (val > local_max) local_max = val;
