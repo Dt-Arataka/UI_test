@@ -285,7 +285,7 @@ void setup() {
 
     // 配置 LEDC 通道 0，频率 5 Hz，分辨率 8 位
     // 5Hz 意味着波形每秒跳变 5 次，在图表上很容易看清
-    ledcSetup(0, 500, 8); 
+    ledcSetup(0, 1000, 8); 
     
     // 将通道 0 绑定到测试引脚
     ledcAttachPin(TEST_SIGNAL_PIN, 0);
