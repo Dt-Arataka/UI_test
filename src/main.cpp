@@ -3,7 +3,7 @@
  * 项目名称: IMSLAS - 自主化学源定位系统 (核心控制与采集单元)
  * 硬件平台: ESP32-S3 (N16R8) + ST7796U (TFT) + FT6336 (Touch) + ADS8681 (ADC)
  * 核心功能: 
- * 1. 产生高精度离子门控制时序 (硬件定时器)
+ * 1. 产生高精度离子门控制时序 (LEDC 硬件 PWM)
  * 2. 高速 ADC 数据采集 (SPI DMA/Burst)
  * 3. 硬件中断级同步采集 (消除 Jitter)
  * 4. 信号累加平均算法 (降噪)
@@ -14,6 +14,10 @@
 #include <Arduino.h> 
 #include <SPI.h>
 #include <Wire.h>
+#include "soc/gpio_periph.h"
+#include "soc/io_mux_reg.h"
+// [新增] LEDC 驱动库 (用于产生无抖动脉冲)
+#include "driver/ledc.h"
 
 // --- 第三方库 ---
 #include <TFT_eSPI.h> 
@@ -37,7 +41,7 @@
 #define CTP_RST_PIN         13       
 
 // IMS 核心控制引脚
-#define ION_GATE_PIN        48      // 离子门控制 (需连接高压驱动光耦)
+#define ION_GATE_PIN        48      // 离子门控制 
 
 // ============================================================================
 // [SECTION 2] IMS 系统参数配置 (System Configuration)
@@ -46,11 +50,13 @@
 // --- 时序与频率参数 ---
 #define IMS_SAMPLE_RATE     1000000 // ADC采样率: 1MSPS (1us/点)
 #define IMS_DURATION_MS     24      // 单次采样窗口: 24ms (适配 UI X轴)
-#define IMS_CYCLE_FREQ      33      // 工作频率: 33Hz (周期约 30.3ms，留出 6ms 处理时间)
+
+// [修正] 频率修正为 33Hz (之前写1000Hz会导致物理层面的信号混叠)
+#define IMS_CYCLE_FREQ      33      // 工作频率: 33Hz (周期约 30.3ms)
 #define IMS_PULSE_WIDTH_US  250     // 离子门开启脉宽: 250us (0.25ms)
 
 // --- 信号处理参数 ---
-#define IMS_AVG_COUNT       16      // 平均次数: 累加 16 次后更新显示 (平衡流畅度与信噪比)
+#define IMS_AVG_COUNT       16     // 平均次数: 累加 16 次后更新显示 (平衡流畅度与信噪比)
 #define RAW_DATA_LEN        (IMS_SAMPLE_RATE * IMS_DURATION_MS / 1000) // 缓冲区长度: 24000 点
 
 // --- UI 显示参数 ---
@@ -67,7 +73,7 @@
 // --- 硬件对象 ---
 TFT_eSPI tft = TFT_eSPI();
 FT6336 ts = FT6336(I2C_SDA_PIN, I2C_SCL_PIN, CTP_INT_PIN, CTP_RST_PIN, TOUCH_RAW_WIDTH, TOUCH_RAW_HEIGHT);
-hw_timer_t *ims_timer = NULL;       // 硬件定时器句柄
+// [移除] hw_timer_t *ims_timer = NULL; // 不再需要软定时器
 
 // --- LVGL 显示缓冲 ---
 static lv_disp_draw_buf_t draw_buf;
@@ -98,7 +104,8 @@ lv_chart_series_t * ui_SignalSeries;
 // ============================================================================
 // [SECTION 4] 函数原型声明 (Function Prototypes)
 // ============================================================================
-void IRAM_ATTR onIMSTimerInterrupt();
+// [修改] 原 onIMSTimerInterrupt 改名为 onIonGateTrigger
+void IRAM_ATTR onIonGateTrigger(void* arg); 
 void IMS_HW_Init();
 void Task_Acquisition(void *pvParameters);
 void Task_UI_Handler(void *pvParameters);
@@ -111,43 +118,84 @@ void my_touchpad_read( lv_indev_drv_t * indev_drv, lv_indev_data_t * data );
 // ============================================================================
 
 /**
- * @brief 硬件定时器中断服务函数
- * @note  IRAM_ATTR 确保代码在 RAM 中运行，最小化延迟
- * @desc  1. 产生离子门控制脉冲
- * 2. 发送信号量同步 ADC 采集任务
+ * @brief [修改] 离子门触发中断服务函数
+ * @note  现在的逻辑是：硬件 LEDC 自动拉高引脚 -> 触发此中断 -> 通知任务采集
+ * 彻底消除了 delay 阻塞和时序抖动。
  */
-void IRAM_ATTR onIMSTimerInterrupt() {
-    // 仅在扫描状态下工作
+void IRAM_ATTR onIonGateTrigger(void* arg) {
+    // 仅在扫描状态下通知采集任务 (虽然 LEDC 可能会一直发波，但我们只在需要时处理)
     if (isScanning) {
-        // [Phase 1] 产生高精度脉冲
-        digitalWrite(ION_GATE_PIN, HIGH);
-        esp_rom_delay_us(IMS_PULSE_WIDTH_US); // 硬件级微秒延时 (250us)
-        digitalWrite(ION_GATE_PIN, LOW);
-
-        // [Phase 2] 触发 ADC 采集 (硬同步)
-        // 唤醒采集任务，使其在离子门关闭的瞬间立即开始工作
-        xSemaphoreGiveFromISR(syncSemaphore, NULL);
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        
+        // 唤醒采集任务 (Zero Latency)
+        xSemaphoreGiveFromISR(syncSemaphore, &xHigherPriorityTaskWoken);
+        
+        if (xHigherPriorityTaskWoken) {
+            portYIELD_FROM_ISR();
+        }
     }
 }
 
 /**
- * @brief 初始化 IMS 专用硬件 (定时器 + GPIO + 同步机制)
+ * @brief 初始化 IMS 专用硬件 (LEDC PWM + GPIO Interrupt)
  */
 void IMS_HW_Init() {
-    // 1. GPIO 配置
-    pinMode(ION_GATE_PIN, OUTPUT);
-    digitalWrite(ION_GATE_PIN, LOW);
-
-    // 2. RTOS 对象创建
+    // 1. 创建同步信号量
     syncSemaphore = xSemaphoreCreateBinary();
 
-    // 3. 硬件定时器配置 (Timer 0, 80MHz/80 = 1MHz, 1 tick = 1us)
-    ims_timer = timerBegin(0, 80, true);
-    timerAttachInterrupt(ims_timer, &onIMSTimerInterrupt, true);
-    timerAlarmWrite(ims_timer, 1000000 / IMS_CYCLE_FREQ, true); // 设定周期
-    timerAlarmEnable(ims_timer);
+    // ===================================================
+    // 2. 配置 LEDC (负责产生脉冲)
+    // ===================================================
+    
+    // 计算占空比
+    uint32_t duty_reg_val = (uint32_t)((float)IMS_PULSE_WIDTH_US * IMS_CYCLE_FREQ * 8192.0 / 1000000.0);
 
-    Serial.println(">> IMS Hardware Driver Initialized (Timer + Sync)");
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_LOW_SPEED_MODE,
+        .duty_resolution  = LEDC_TIMER_13_BIT,
+        .timer_num        = LEDC_TIMER_0,
+        .freq_hz          = IMS_CYCLE_FREQ,  
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&ledc_timer);
+
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num       = ION_GATE_PIN,      // 这里填 48 (或你实际用的引脚)
+        .speed_mode     = LEDC_LOW_SPEED_MODE,
+        .channel        = LEDC_CHANNEL_0,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .timer_sel      = LEDC_TIMER_0,
+        .duty           = duty_reg_val, 
+        .hpoint         = 0,
+        .flags          = { .output_invert = 0 }
+    };
+    ledc_channel_config(&ledc_channel);
+    
+    // 强制启动更新
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+
+    // ===================================================
+    // 3. 【关键】开启内部输入回环 (修复输出为0和中断不触发的问题)
+    // ===================================================
+    
+    // 这行代码直接操作 IO MUX 寄存器，打开 Input Enable 位
+    // 无论引脚号是多少(48也行)，都不会溢出，因为它是数组索引操作
+    PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[ION_GATE_PIN]);
+
+    // ===================================================
+    // 4. 配置 GPIO 中断 (监听同一个引脚)
+    // ===================================================
+    
+    // 安装中断服务
+    gpio_install_isr_service(0); 
+    
+    // 设置上升沿触发
+    gpio_set_intr_type((gpio_num_t)ION_GATE_PIN, GPIO_INTR_POSEDGE);
+    
+    // 添加中断回调
+    gpio_isr_handler_add((gpio_num_t)ION_GATE_PIN, onIonGateTrigger, NULL);
+
+    Serial.printf(">> IMS Init Done. Pin %d Mode: LEDC Output + Internal Input\n", ION_GATE_PIN);
 }
 
 // ============================================================================
@@ -156,20 +204,21 @@ void IMS_HW_Init() {
 
 /**
  * @brief 任务 1: ADC 采集与信号处理 (运行于 Core 1)
- * @desc  高优先级任务，负责同步采集、累加、平均运算
  */
 void Task_Acquisition(void *pvParameters) {
     (void) pvParameters;
-    int average_counter = 0; // 累加计数器
+    int average_counter = 0; 
 
+    Serial.println("DEBUG: Acquisition Task Started!");
     while (true) {
-        // 内存安全检查
         if (big_raw_buffer == NULL || accumulator_buffer == NULL) {
             vTaskDelay(100);
             continue;
         }
 
-        // [BLOCKING] 等待硬件中断的同步信号 (硬同步核心)
+        // [BLOCKING] 等待信号量
+        // 这里现在由 GPIO 中断触发，且完全同步于 LEDC 脉冲上升沿
+        // 延迟固定，波形不再漂移
         if (xSemaphoreTake(syncSemaphore, portMAX_DELAY) == pdTRUE) {
             
             // 停止状态下的清理逻辑
@@ -180,61 +229,54 @@ void Task_Acquisition(void *pvParameters) {
             }
 
             // --- 阶段 1: 高速采集 ---
-            // 此时 T=0 (离子门刚动作)，立即读取 24ms 数据
+            // 此时 T ≈ 10us (中断延迟)，非常接近物理 T=0
             IMS_ADC_ReadBurst(big_raw_buffer, RAW_DATA_LEN);
-
+            Serial.println("DEBUG: ADC Read Done.");
             // --- 阶段 2: 数据累加 ---
             for (int i = 0; i < RAW_DATA_LEN; i++) {
                 uint16_t raw_val = big_raw_buffer[i];
-                // 大小端转换 (ADS8681 SPI 协议适配)
+                // 大小端转换
                 raw_val = (raw_val << 8) | (raw_val >> 8); 
                 accumulator_buffer[i] += raw_val;
             }
             average_counter++;
 
-            // --- 阶段 3: 平均与压缩 (当攒够 IMS_AVG_COUNT 次) ---
+            // --- 阶段 3: 平均与压缩 ---
             if (average_counter >= IMS_AVG_COUNT) {
                 
-                // 尝试获取 UI 数据锁 (不阻塞太久，丢帧保流)
                 if (xSemaphoreTake(dataMutex, 10) == pdTRUE) { 
                     
                     int ratio = RAW_DATA_LEN / CHART_POINTS;
                     int global_max_val = 0;
+                    // [修正建议] 这里为了精确时间，可以记录精确索引，暂保持原样以免改动太多
                     int global_max_idx = 0;
 
-                    // 降采样与平均值计算
                     for (int i = 0; i < CHART_POINTS; i++) {
                         int local_max_avg = 0;
                         
-                        // Peak Hold 算法: 在区间内找最大值
                         for (int j = 0; j < ratio; j++) {
                             int idx = i * ratio + j;
                             if (idx >= RAW_DATA_LEN) break;
 
-                            // 核心计算: 累加值 / N
                             int avg_val = accumulator_buffer[idx] / IMS_AVG_COUNT;
                             if (avg_val > local_max_avg) local_max_avg = avg_val;
                         }
 
-                        // 存入显示 Buffer (缩小比例适配屏幕)
                         waveform_buffer[i] = local_max_avg / 16;
 
-                        // 寻找全谱最大值 (用于数值显示)
                         if (local_max_avg > global_max_val) {
                             global_max_val = local_max_avg;
                             global_max_idx = i * ratio;
                         }
                     }
 
-                    // 物理量换算
-                    detected_peak_time = (float)global_max_idx / 1000.0; // us -> ms
+                    detected_peak_time = (float)global_max_idx / 1000.0; 
                     detected_peak_amp = global_max_val / 16;
 
-                    ui_update_needed = true; // 通知 UI 任务刷新
+                    ui_update_needed = true; 
                     xSemaphoreGive(dataMutex);
                 }
 
-                // 清空累加器，准备下一轮
                 memset(accumulator_buffer, 0, RAW_DATA_LEN * sizeof(uint32_t));
                 average_counter = 0;
             }
@@ -242,26 +284,42 @@ void Task_Acquisition(void *pvParameters) {
     }
 }
 
+// // 临时调试代码
+// void Task_Acquisition(void *pvParameters) {
+//     // ... setup ...
+//     pinMode(ION_GATE_PIN, INPUT); // 确保是输入模式
+
+//     while (true) {
+//         // 疯狂打印引脚状态，看看是不是一直是 0 或一直是 1
+//         int val = digitalRead(ION_GATE_PIN);
+//         Serial.printf("%d", val); 
+        
+//         // 正常应该看到 00000010000001... (偶尔有个1)
+//         // 如果全是 0，说明 LEDC 没输出，或者引脚被短路了
+        
+//         vTaskDelay(1);
+//     }
+// }
+
+
+
+
 /**
  * @brief 任务 2: UI 界面刷新 (运行于 Core 0)
- * @desc  中优先级任务，负责 LVGL 渲染和屏幕刷新，不干扰采集
+ * 注：此任务代码未修改，保持原样
  */
 void Task_UI_Handler(void *pvParameters) {
     (void) pvParameters;
 
     while (true) {
-        // 1. 检查数据更新
         if (ui_update_needed) {
-            // 非阻塞尝试拿锁
             if (xSemaphoreTake(dataMutex, 0) == pdTRUE) { 
                 
-                // A. 刷新图表
                 if (ui_SignalSeries != NULL) {
                     lv_chart_set_ext_y_array(ui_Chart1, ui_SignalSeries, (lv_coord_t*)waveform_buffer);
                     lv_chart_refresh(ui_Chart1); 
                 }
 
-                // B. 刷新数值标签
                 if (isScanning && detected_peak_amp > 0) {
                     static char buf_time[16];
                     static char buf_amp[16];
@@ -271,7 +329,6 @@ void Task_UI_Handler(void *pvParameters) {
                     if(ui_Label18) lv_label_set_text(ui_Label18, buf_time); 
                     if(ui_Label19) lv_label_set_text(ui_Label19, buf_amp);
                 } else {
-                    // 停止时显示占位符
                     if(ui_Label18) lv_label_set_text(ui_Label18, "--.--");
                 }
                 
@@ -280,11 +337,8 @@ void Task_UI_Handler(void *pvParameters) {
             }
         }
 
-        // 2. LVGL 心跳维护
         lv_timer_handler();
         lv_tick_inc(5);
-        
-        // 3. 任务延时 (防止看门狗复位，让渡 Core 0 资源)
         vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 }
@@ -293,7 +347,6 @@ void Task_UI_Handler(void *pvParameters) {
 // [SECTION 7] 回调与辅助函数 (Callbacks & Helpers)
 // ============================================================================
 
-// SquareLine 导出的按钮事件回调
 void OnScanClick(lv_event_t * e) {
     isScanning = !isScanning;
     
@@ -311,7 +364,6 @@ void OnScanClick(lv_event_t * e) {
     }
 }
 
-// LVGL 显示驱动刷新回调
 void my_disp_flush( lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p ) {
     uint32_t w = ( area->x2 - area->x1 + 1 );
     uint32_t h = ( area->y2 - area->y1 + 1 );
@@ -322,13 +374,12 @@ void my_disp_flush( lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *
     lv_disp_flush_ready( disp_drv );
 }
 
-// LVGL 触摸驱动读取回调
 void my_touchpad_read( lv_indev_drv_t * indev_drv, lv_indev_data_t * data ) {
     ts.read(); 
     if( ts.touches > 0 ) {
         data->state = LV_INDEV_STATE_PR;
         data->point.x = ts.points[0].y;        
-        data->point.y = 319 - ts.points[0].x; // 坐标旋转适配
+        data->point.y = 319 - ts.points[0].x; 
     } else {
         data->state = LV_INDEV_STATE_REL;
     }
@@ -339,7 +390,6 @@ void my_touchpad_read( lv_indev_drv_t * indev_drv, lv_indev_data_t * data ) {
 // ============================================================================
 
 void setup() {
-    // 1. 基础通信初始化
     Serial.begin(115200);
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     
@@ -347,48 +397,35 @@ void setup() {
     Serial.println("IMSLAS System Booting...");
     Serial.println("==================================");
 
-    // 2. RTOS 资源初始化
     dataMutex = xSemaphoreCreateMutex();
 
-    // 3. 硬件设备初始化
-    IMS_ADC_Init(); // ADS8681 初始化
+    IMS_ADC_Init(); 
     Serial.println("[OK] ADC Hardware Initialized.");
 
-    // 4. 大容量内存分配 (PSRAM 优先)
     size_t raw_size_bytes = RAW_DATA_LEN * sizeof(uint16_t);
     size_t acc_size_bytes = RAW_DATA_LEN * sizeof(uint32_t); 
 
     Serial.printf("[INFO] Memory Req: Raw=%.2f KB, Acc=%.2f KB\n", raw_size_bytes/1024.0, acc_size_bytes/1024.0);
 
-    // 尝试在 SPIRAM 分配
     big_raw_buffer = (uint16_t *)heap_caps_malloc(raw_size_bytes, MALLOC_CAP_SPIRAM);
     accumulator_buffer = (uint32_t *)heap_caps_malloc(acc_size_bytes, MALLOC_CAP_SPIRAM);
 
-    // 失败降级处理 (尝试内部 RAM)
-    if (big_raw_buffer == NULL) {
-        Serial.println("[WARN] PSRAM Raw Buffer Alloc Failed. Trying Internal RAM.");
-        big_raw_buffer = (uint16_t *)malloc(raw_size_bytes);
-    }
-    if (accumulator_buffer == NULL) {
-        Serial.println("[WARN] PSRAM Acc Buffer Alloc Failed. Trying Internal RAM.");
-        accumulator_buffer = (uint32_t *)malloc(acc_size_bytes);
-    }
+    if (big_raw_buffer == NULL) big_raw_buffer = (uint16_t *)malloc(raw_size_bytes);
+    if (accumulator_buffer == NULL) accumulator_buffer = (uint32_t *)malloc(acc_size_bytes);
 
-    // 致命错误检查
     if (big_raw_buffer == NULL || accumulator_buffer == NULL) {
         Serial.println("[CRITICAL] Memory Alloc Failed! Halted.");
         while(1);
     }
     
-    // 内存清零
     memset(big_raw_buffer, 0, raw_size_bytes);
     memset(accumulator_buffer, 0, acc_size_bytes);
     Serial.println("[OK] Memory Allocated & Cleared.");
 
-    // 5. 启动 IMS 核心控制 (定时器 + 中断)
+    // 5. [修改] 启动 IMS 核心控制 (现在是 LEDC + GPIO Sync)
     IMS_HW_Init();
 
-    // 6. UI 子系统初始化 (TFT + LVGL)
+    // 6. UI 子系统初始化 (保持不变)
     tft.init();
     tft.setRotation(1);
     tft.invertDisplay(true);
@@ -415,9 +452,8 @@ void setup() {
     indev_drv.read_cb = my_touchpad_read;
     lv_indev_drv_register( &indev_drv );
 
-    ui_init(); // SquareLine 生成的 UI 初始化
+    ui_init(); 
     
-    // 获取图表句柄并配置
     ui_SignalSeries = lv_chart_get_series_next(ui_Chart1, NULL);
     lv_chart_set_update_mode(ui_Chart1, LV_CHART_UPDATE_MODE_SHIFT);
     lv_chart_set_point_count(ui_Chart1, CHART_POINTS);
@@ -427,15 +463,8 @@ void setup() {
     // 7. 启动多任务处理
     Serial.println("[INFO] Starting Tasks...");
 
-    // 任务 A: 采集 (绑定 Core 1, 高优)
-    xTaskCreatePinnedToCore(
-        Task_Acquisition, "IMS_ADC_Core1", 8192, NULL, 10, NULL, 1 
-    );
-    
-    // 任务 B: UI 显示 (绑定 Core 0, 中优)
-    xTaskCreatePinnedToCore(
-        Task_UI_Handler, "IMS_UI_Core0", 8192, NULL, 5, &TaskHandle_UI, 0 
-    );
+    xTaskCreatePinnedToCore(Task_Acquisition, "IMS_ADC_Core1", 8192, NULL, 10, NULL, 1);
+    xTaskCreatePinnedToCore(Task_UI_Handler, "IMS_UI_Core0", 8192, NULL, 5, &TaskHandle_UI, 0);
 
     Serial.println(">> IMS System Ready & Running. Waiting for user command.");
 }
@@ -445,7 +474,5 @@ void setup() {
 // ============================================================================
 
 void loop() {
-    // 主循环已空置，所有逻辑均由 RTOS 任务接管
-    // 仅用于防止编译器优化或作为空闲钩子
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
