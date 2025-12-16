@@ -54,7 +54,7 @@
 #define IMS_DURATION_MS     24      // 单次采样窗口: 24ms (适配 UI X轴)
 
 #define IMS_CYCLE_FREQ      33      // 工作频率: 33Hz (周期约 30.3ms)
-#define IMS_PULSE_WIDTH_US  100000    // 离子门开启脉宽: 250us (0.25ms)
+#define IMS_PULSE_WIDTH_US  500    // 离子门开启脉宽: 250us (0.25ms)
 
 // --- 信号处理参数 ---
 #define IMS_AVG_COUNT        24     // 平均次数: 累加 16 次后更新显示 (平衡流畅度与信噪比)
@@ -258,6 +258,7 @@ void Task_Acquisition(void *pvParameters) {
 
                             int avg_val = accumulator_buffer[idx] / IMS_AVG_COUNT;
                             if (avg_val > local_max_avg) local_max_avg = avg_val;
+                            
                         }
 
                         waveform_buffer[i] = local_max_avg / 16;
