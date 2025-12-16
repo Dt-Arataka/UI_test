@@ -29,6 +29,7 @@
 // --- 本地头文件 ---
 #include "ui/ui.h"
 #include "IMS_ADC.h"
+#include "UI_Manager.h"
 
 // ============================================================================
 // [SECTION 1] 硬件引脚定义 (Hardware Pin Definitions)
@@ -53,7 +54,7 @@
 #define IMS_SAMPLE_RATE     1000000 // ADC采样率: 1MSPS (1us/点)
 #define IMS_DURATION_MS     24      // 单次采样窗口: 24ms (适配 UI X轴)
 
-#define IMS_CYCLE_FREQ      33      // 工作频率: 33Hz (周期约 30.3ms)
+#define IMS_CYCLE_FREQ      330      // 工作频率: 33Hz (周期约 30.3ms)
 #define IMS_PULSE_WIDTH_US  500    // 离子门开启脉宽: 250us (0.25ms)
 
 // --- 信号处理参数 ---
@@ -92,8 +93,9 @@ TaskHandle_t      TaskHandle_UI;     // UI 任务句柄
 // --- 业务状态变量 ---
 volatile bool isScanning         = false; // 扫描开关
 float         detected_peak_time = 0.0;   // 检测到的峰值时间 (ms)
-int           detected_peak_amp  = 0;     // 检测到的峰值幅度
+float         detected_peak_amp  = 0.0;     // 检测到的峰值幅度
 bool          ui_update_needed   = false; // UI 刷新标志位
+float         temp_captured_time = 0.0;
 
 // --- UI 对象引用 ---
 lv_chart_series_t *ui_SignalSeries;
@@ -261,7 +263,7 @@ void Task_Acquisition(void *pvParameters) {
                             
                         }
 
-                        waveform_buffer[i] = local_max_avg / 16;
+                        waveform_buffer[i] = local_max_avg / 128;
 
                         if (local_max_avg > global_max_val) {
                             global_max_val = local_max_avg;
@@ -270,7 +272,7 @@ void Task_Acquisition(void *pvParameters) {
                     }
 
                     detected_peak_time = (float)global_max_idx / 1000.0;
-                    detected_peak_amp  = global_max_val / 16;
+                    detected_peak_amp  = global_max_val / 12800.0;
 
                     ui_update_needed = true;
                     xSemaphoreGive(dataMutex);
@@ -305,7 +307,7 @@ void Task_UI_Handler(void *pvParameters) {
                     static char buf_time[16];
                     static char buf_amp[16];
                     sprintf(buf_time, "%.2f ms", detected_peak_time);
-                    sprintf(buf_amp, "%d", detected_peak_amp);
+                    sprintf(buf_amp, "%.2f V", detected_peak_amp);
 
                     if (ui_Label18) lv_label_set_text(ui_Label18, buf_time);
                     if (ui_Label19) lv_label_set_text(ui_Label19, buf_amp);
@@ -434,6 +436,10 @@ void setup() {
     lv_indev_drv_register(&indev_drv);
 
     ui_init();
+
+    Init_Library();        // 从 Flash 读取历史数据
+    Refresh_Library_UI();  // 将数据绘制到 Screen 3 的列表中
+
 
     ui_SignalSeries = lv_chart_get_series_next(ui_Chart1, NULL);
     lv_chart_set_update_mode(ui_Chart1, LV_CHART_UPDATE_MODE_SHIFT);

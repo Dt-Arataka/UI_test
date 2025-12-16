@@ -19,6 +19,7 @@ extern lv_obj_t * ui_Button1;
 extern lv_obj_t * ui_Label1;
 extern lv_obj_t * ui_Button3;
 extern lv_obj_t * ui_Label3;
+extern void ui_event_Button4(lv_event_t * e);
 extern lv_obj_t * ui_Button4;
 extern lv_obj_t * ui_Label4;
 extern lv_obj_t * ui_Button5;

@@ -11,6 +11,8 @@ extern "C" {
 #endif
 
 void OnScanClick(lv_event_t * e);
+void OnSaveSubstance(lv_event_t * e);
+void OnConfirmSave(lv_event_t * e);
 
 #ifdef __cplusplus
 } /*extern "C"*/
