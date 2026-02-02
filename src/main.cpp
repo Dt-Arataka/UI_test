@@ -92,6 +92,15 @@ SemaphoreHandle_t dataMutex;         // 数据互斥锁 (保护 UI 显示数据)
 SemaphoreHandle_t syncSemaphore;     // 同步信号量 (中断 -> 采集任务)
 TaskHandle_t      TaskHandle_UI;     // UI 任务句柄
 
+// --- 远程命令队列（网页按钮 -> UI线程执行）---
+enum RemoteCmd : uint8_t {
+  CMD_START = 1,
+  CMD_PAUSE = 2,
+  CMD_SAVE  = 3,
+};
+QueueHandle_t remoteCmdQueue = nullptr;
+
+
 // --- 业务状态变量 ---
 volatile bool isScanning         = false; // 扫描开关
 float         detected_peak_time = 0.0;   // 检测到的峰值时间 (ms)
@@ -113,23 +122,30 @@ void           Task_UI_Handler(void *pvParameters);
 void           OnScanClick(lv_event_t *e);
 void           my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p);
 void           my_touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data);
+static void    SetScanning(bool on);
 
 
+
+static void postCmd(RemoteCmd cmd) {
+  if (!remoteCmdQueue) return;
+  xQueueSend(remoteCmdQueue, &cmd, 0);
+}
 
 static void cbStart() {
   Serial.println("[REMOTE] START pressed");
-  // TODO: 这里换成 enqueue(CMD_START) 或你的 start_acquire()
+  postCmd(CMD_START);
 }
 
 static void cbPause() {
   Serial.println("[REMOTE] PAUSE pressed");
-  // TODO: enqueue(CMD_PAUSE) 或 pause_acquire()
+  postCmd(CMD_PAUSE);
 }
 
 static void cbSave() {
   Serial.println("[REMOTE] SAVE pressed");
-  // TODO: enqueue(CMD_SAVE) 或 save_data()
+  postCmd(CMD_SAVE);
 }
+
 
 
 
@@ -317,6 +333,31 @@ void Task_UI_Handler(void *pvParameters) {
     (void)pvParameters;
 
     while (true) {
+
+        // ===========================
+        // [新增] 处理网页端命令（UI线程执行，避免 LVGL 线程不安全）
+        // ===========================
+        RemoteCmd cmd;
+        while (remoteCmdQueue && xQueueReceive(remoteCmdQueue, &cmd, 0) == pdTRUE) {
+            if (cmd == CMD_START) {
+                // 1) 先切到谱图界面（Screen2）
+                if (ui_Screen2) {
+                    lv_scr_load(ui_Screen2);
+                    // 让切屏立刻生效（可选但推荐，视觉上更“立马”）
+                    lv_timer_handler();
+                }
+                // 2) 再开始采集
+                SetScanning(true);
+            } else if (cmd == CMD_PAUSE) {
+                SetScanning(false);
+            } else if (cmd == CMD_SAVE) {
+                // 等价于本地“保存物质”：暂停 + 搬运数据 + 切到 Screen3
+                SetScanning(false);
+                OnSaveSubstance(nullptr);
+                if (ui_Screen3) lv_scr_load(ui_Screen3);
+            }
+        }
+
         if (ui_update_needed) {
             if (xSemaphoreTake(dataMutex, 0) == pdTRUE) {
 
@@ -337,6 +378,13 @@ void Task_UI_Handler(void *pvParameters) {
                     if (ui_Label18) lv_label_set_text(ui_Label18, "--.--");
                 }
 
+                // ===========================
+                // [新增] 推送同一帧谱图到网页（保证网页与本地显示一致）
+                // ===========================
+                remote.pushWaveform(waveform_buffer, CHART_POINTS,
+                                    detected_peak_time, detected_peak_amp,
+                                    isScanning);
+
                 ui_update_needed = false;
                 xSemaphoreGive(dataMutex);
             }
@@ -348,26 +396,43 @@ void Task_UI_Handler(void *pvParameters) {
     }
 }
 
+
 // ============================================================================
 // [SECTION 7] 回调与辅助函数 (Callbacks & Helpers)
 // ============================================================================
 
-void OnScanClick(lv_event_t *e) {
-    isScanning = !isScanning;
+static void SetScanning(bool on) {
+  isScanning = on;
 
-    lv_obj_t *ui_Button9 = lv_event_get_target(e);
-    lv_obj_t *label      = lv_obj_get_child(ui_Button9, 0);
+  // 同步本地 UI 按钮文案/颜色（ui_Button9 是 SquareLine 导出的全局对象）
+  if (ui_Button9) {
+    lv_obj_t *label = lv_obj_get_child(ui_Button9, 0);
+    if (label) lv_label_set_text(label, on ? "暂停扫描" : "开始扫描");
+    lv_obj_set_style_bg_color(ui_Button9,
+                              lv_color_hex(on ? 0x00AA00 : 0x0869B4),
+                              LV_PART_MAIN);
+  }
 
-    if (isScanning) {
-        lv_label_set_text(label, "暂停扫描");
-        lv_obj_set_style_bg_color(ui_Button9, lv_color_hex(0x00AA00), LV_PART_MAIN);
-        Serial.println("Action: IMS Start Scanning");
-    } else {
-        lv_label_set_text(label, "开始扫描");
-        lv_obj_set_style_bg_color(ui_Button9, lv_color_hex(0x0869B4), LV_PART_MAIN);
-        Serial.println("Action: IMS Stop Scanning");
-    }
+  Serial.println(on ? "Action: IMS Start Scanning" : "Action: IMS Stop Scanning");
+
+  // 推送一次状态到网页端（峰值信息尽量带上，抢不到锁也没关系）
+  float pt = 0.0f, pa = 0.0f;
+  if (dataMutex && xSemaphoreTake(dataMutex, 0) == pdTRUE) {
+    pt = detected_peak_time;
+    pa = detected_peak_amp;
+    xSemaphoreGive(dataMutex);
+  }
+  remote.pushStatus(pt, pa, isScanning);
 }
+
+
+
+
+void OnScanClick(lv_event_t *e) {
+  (void)e;
+  SetScanning(!isScanning);
+}
+
 
 void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
     uint32_t w = (area->x2 - area->x1 + 1);
@@ -398,6 +463,7 @@ void setup() {
     Serial.begin(115200);
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
+    remoteCmdQueue = xQueueCreate(8, sizeof(RemoteCmd));
 
 
     remote.onStart(cbStart);
