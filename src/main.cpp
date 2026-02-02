@@ -30,7 +30,9 @@
 #include "ui/ui.h"
 #include "IMS_ADC.h"
 #include "UI_Manager.h"
+#include "IMS_RemoteWeb.h"
 
+IMS_RemoteWeb remote;
 // ============================================================================
 // [SECTION 1] 硬件引脚定义 (Hardware Pin Definitions)
 // ============================================================================
@@ -54,7 +56,7 @@
 #define IMS_SAMPLE_RATE     1000000 // ADC采样率: 1MSPS (1us/点)
 #define IMS_DURATION_MS     24      // 单次采样窗口: 24ms (适配 UI X轴)
 
-#define IMS_CYCLE_FREQ      330      // 工作频率: 33Hz (周期约 30.3ms)
+#define IMS_CYCLE_FREQ      33      // 工作频率: 33Hz (周期约 30.3ms)
 #define IMS_PULSE_WIDTH_US  500    // 离子门开启脉宽: 250us (0.25ms)
 
 // --- 信号处理参数 ---
@@ -111,6 +113,26 @@ void           Task_UI_Handler(void *pvParameters);
 void           OnScanClick(lv_event_t *e);
 void           my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p);
 void           my_touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data);
+
+
+
+static void cbStart() {
+  Serial.println("[REMOTE] START pressed");
+  // TODO: 这里换成 enqueue(CMD_START) 或你的 start_acquire()
+}
+
+static void cbPause() {
+  Serial.println("[REMOTE] PAUSE pressed");
+  // TODO: enqueue(CMD_PAUSE) 或 pause_acquire()
+}
+
+static void cbSave() {
+  Serial.println("[REMOTE] SAVE pressed");
+  // TODO: enqueue(CMD_SAVE) 或 save_data()
+}
+
+
+
 
 // ============================================================================
 // [SECTION 5] IMS 硬件驱动与中断 (Hardware Drivers & ISR)
@@ -376,6 +398,21 @@ void setup() {
     Serial.begin(115200);
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
+
+
+    remote.onStart(cbStart);
+    remote.onPause(cbPause);
+    remote.onSave(cbSave);
+
+    bool ok = remote.beginAP("IMS_CTRL", "12345678");
+    if(!ok){
+      Serial.println("AP start failed!");
+      while(true) delay(1000);
+    }
+
+
+
+    
     Serial.println("\n\n==================================");
     Serial.println("IMSLAS System Booting...");
     Serial.println("==================================");
